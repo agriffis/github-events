@@ -1,0 +1,112 @@
+#!/bin/bash
+#
+# fetch-github-events - store GitHub user events locally as JSONL
+#
+# Written in 2019 by Aron Griffis <aron@arongriffis.com>
+#
+# To the extent possible under law, the author(s) have dedicated all copyright
+# and related and neighboring rights to this software to the public domain
+# worldwide. This software is distributed without any warranty.
+#
+# CC0 Public Domain Dedication at
+# http://creativecommons.org/publicdomain/zero/1.0/
+#==============================================================================
+
+main() {
+    declare config documents db login token p id result tmp
+
+    # We will be piping API results through jq, and would like to fail out of
+    # the script if either the API call fails (left side of the pipe) or the jq
+    # parsing fails (right side of the pipe). Normally set -e only causes the
+    # script to terminate if the last command in the pipeline returns non-zero
+    # status.
+    set -e -o pipefail
+
+    # Find where configs and documents are stored.
+    config=${XDG_CONFIG_HOME:-~/.config}
+    documents=$(xdg-user-dir DOCUMENTS 2>/dev/null || true)
+    documents=${documents:-~/Documents}
+    assert config documents
+
+    # Store the downloaded events in a JSONL database, which works really well
+    # for appending new data. For more information about JSONL see
+    # http://jsonlines.org/
+    db=$documents/github-events.jsonl
+
+    # Load login and token from the hub command.
+    # This uses yq which is jq for YAML.
+    login=$(yq -r '.["github.com"][0].user' <"$config/hub")
+    token=$(yq -r '.["github.com"][0].oauth_token' <"$config/hub")
+    assert login token
+
+    # Our database is in ascending order, with the most recent event last, so
+    # that we can append new events to it. The API returns events with the most
+    # recent event first, so we'll collect them in a temporary file that gets
+    # cleaned up automatically when the script exits.
+    tmp=$(mktemp)
+    cleanup() { rm -f "$tmp"; }
+    trap 'cleanup; exit' 0
+
+    # If the database exists, get the last id received from the API.
+    if [[ -s $db ]]; then
+        id=$(tail -n1 "$db" | jq -r .id)
+    else
+        id=0
+    fi
+    assert id
+
+    # The events API returns 30 records per page, with 10 pages available.
+    # jq -c '.[]' converts the incoming array to JSONL. The select looks for
+    # records that are newer than our most recent. Stop fetching pages when the
+    # call doesn't return any new records.
+    for p in {1..10}; do
+        result=$(get "/users/$login/events" page==$p | jq -c ".[] | select(.id | tonumber > $id)")
+        [[ -n $result ]] || break
+        echo "$result" >> "$tmp"
+    done
+
+    # Avoid updating the timestamp on the DB if there were no new records
+    # available.
+    if [[ -s $tmp ]]; then
+        info "Fetched $(wc -l < "$tmp") events"
+        # New records will be in descending order. Flip them around and append
+        # to the end of our DB.
+        tac "$tmp" >> "$db"
+    fi
+
+    exit # always at bottom of main
+}
+
+get() {
+    api GET "$@"
+}
+
+api() {
+    declare method="$1" path="$2"
+    shift 2
+    assert method path token
+    http --check-status "$method" "https://api.github.com$path" \
+        accept:application/vnd.github.v3+json \
+        authorization:"token $token" \
+        "$@"
+}
+
+info() {
+    if [[ -t 1 ]]; then
+        echo "$*"
+    fi
+}
+
+assert() {
+    declare v
+    for v; do
+        [[ -n "${!v}" ]] || die "\$$v is empty"
+    done
+}
+
+die() {
+    echo "fatal: $*" >&2
+    exit 1
+}
+
+[[ "$0" != "$BASH_SOURCE" ]] || main "$@"
